@@ -1,0 +1,435 @@
+USE [ProdTracking_Dev]
+GO
+/****** Object:  StoredProcedure [dbo].[uspManageIDAR]    Script Date: 3/29/2018 11:49:37 AM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+-- =============================================
+-- Author:		Alan Cannon
+-- Create date: 03-Oct-2017
+-- Update Date: 
+-- Description:	manage IDAR Data From Web Service
+-- Create Passes the MaterialID, QCReason, Department and Base QTY to be Held
+-- Update Passes the Volume into one of the catrgories (Re-Inventoried, Scrapped or Re-Grind)
+-- Verified Allows for the Document Control process to be emailed to the Person(s) to apply their signature for the disposition
+-- Validated Allows for the Document Control process to be emailed to the Department Manager (s) to apply their signature
+-- CLosed is for the QC departemnt Person (s) to apply their signature to close the IDAR record.
+-- Records Closed after 30 days will get an Archived Status. Data offload TBD
+-- =============================================
+ALTER PROCEDURE [dbo].[uspManageIDAR]
+	-- Add the parameters for the stored procedure here
+	-- Inputs
+		@intprocessType int,				-- Create New, Updated, Verified, Validated, Closed
+		@intIdarRecord int,					-- Idar record to Manage if Process type = Close
+		@ItemMasterID int,					-- UID from Material Master Query
+		@intQcAttrib int,					-- UID from tblQCAttributes
+		@intQTY int,						-- How many
+		@intQtyType int,					-- Qty Type (Totes=1, Cases=2, Pieces=3)
+		@intDept int,						-- Department ID
+		@intMachine int,					-- If Available machine ID
+		@intUserID int,						-- User Id From tblUsers with Query
+		@intreInvenQty int,					-- If this Record is to be Updated, then this Value would be Non Zero
+		@intScrapQty int,					-- If this Record is to be Updated, then this Value would be Non Zero
+		@intRegrindQty int,					-- If this Record is to be Updated, then this Value would be Non Zero
+	
+	--Outputs
+		@vStrShift varchar(2) output,
+		@intIdarID int output,
+		@intResultCode int output,			-- Result Code Standard Return Value 0 = fail, 1=pass
+		@strResultText nvarchar(255) output	-- Text to return if we fail the call
+AS
+
+ Declare @intStatus_New int, @intStatus_Update int, @intStatus_Verified int, @intStatus_Validate int,@intStatus_Close int, @intStatus_Archived int
+ Declare @intMatNrCheck int, @intUserIdCheck int, @intDeptIDCheck int, @intQCAttribCheck int, @intShiftID int
+ Declare @intMachineCheck int, @intIdarRecordCheck int,@intIdarRecordStatus int, @intrecordQty int
+ Declare @UserName varchar(255),@vStrQty_Type varchar(20),@vStrItemMaster_Desc nvarchar(255),@vStrQcAttrib_Desc nvarchar(100)
+ Declare @Email_Subject nvarchar(500),@Email_Body nvarchar(max),@EmailQuery_Results nvarchar(max),@Email_FIleName nvarchar(255)
+ Declare @CreateYear int,@CreateDay int,@CreateMonth int,@CreateHour int,@CreateMiniute int,@CreateDate varchar(35)
+
+ Declare @vStrStatement varchar(200),@strTemp varchar(255)
+
+BEGIN
+	-- SET NOCOUNT ON added to prevent extra result sets from
+	-- interfering with SELECT statements.
+	SET NOCOUNT ON;
+	Set Quoted_Identifier ON;
+	Set @intResultCode = 0
+	Set @strResultText = ''
+	Set @intShiftID = 0
+	Set @intIdarRecordCheck = 0
+
+	/* Hack Alert-- Save these until Full testing Completed
+	Set @intStatus_New = 1
+	Set @intStatus_Update = 2
+	Set @intStatus_Verified = 3
+	Set @intStatus_Validate = 4
+	Set @intStatus_Close = 5
+	*/
+
+    -- Insert statements for procedure here
+	begin try
+		
+		-- Gather the IDAR Status Place Holders
+			Set @intStatus_New = (Select [UID] from tblQCIdar_Status Where [Name] = 'New')
+			Set @intStatus_Update = (Select [UID] from tblQCIdar_Status Where [Name] = 'Updated')
+			Set @intStatus_Verified = (Select [UID] from tblQCIdar_Status Where [Name] = 'Verified')
+			Set @intStatus_Validate = (Select [UID] from tblQCIdar_Status Where [Name] = 'Validated')
+			Set @intStatus_Close = (Select [UID] from tblQCIdar_Status Where [Name] = 'Closed')
+			Set @intStatus_Archived = (Select [UID] from tblQCIdar_Status Where [Name] = 'Archived')
+
+		-- Based on the process Request lets Look at the Passed Values
+		-- If the Request is CreateNew
+		IF @intprocessType=@intStatus_New
+			begin
+			--Check the Entry before proceeding
+				if isnull(@ItemMasterID,0)=0 raiserror(51001,16,1,'Item master')	-- "Parameter %s not supplied."
+				if isnull(@intQcAttrib,0)=0 raiserror(51001,16,1,'reason Why')		-- "Parameter %s not supplied."
+				if isnull(@intQTY,0)=0 raiserror(51001,16,1,'Qty')					-- "Parameter %s not supplied."
+				if isnull(@intDept,0)=0 raiserror(51001,16,1,'Department')			-- "Parameter %s not supplied."
+				if isnull(@intQtyType,0)=0 raiserror(51001,16,1,'Qty Type')			-- "Parameter %s not supplied."
+				if isnull(@intUserID,0)=0 raiserror(51001,16,1,'User ID')			-- "Parameter %s not supplied."
+
+			-- Check the Entries if their valid values. Could be Issues with the values posting from source
+				Set @intMatNrCheck = (SELECT [UID] FROM [tblMaterialMaster] Where [UID] = @ItemMasterID)
+				Set @intUserIdCheck = (Select [UID] from tblUsers Where [UID] = @intUserID)
+				Set @intDeptIDCheck = (Select [UID] from tblDepartments where [UID] = @intDept)
+				Set @intQCAttribCheck = (Select [UID] from [tblQCAttributes] Where [UID] = @intQcAttrib)
+				Set @intMachineCheck = (Select [UID] from tblMachineDef Where [UID] = @intMachine)
+				Set @intIdarRecordCheck =(Select [UID] from tblQC_Idars Where [UID] =@intIdarRecord)
+				Set @vStrItemMaster_Desc = (Select Matnr From tblMaterialMaster Where [UID] = @ItemMasterID)
+				Set @vStrQcAttrib_Desc = (Select QA_Attrib from [tblQCAttributes] Where [UID] = @intQcAttrib)
+
+			-- Set the QTY Type from the Input
+				If @intQtyType=1
+					Begin
+						Set @vStrQty_Type = 'Cases'
+					End
+				if @intQtyType =2
+					Begin
+						Set @vStrQty_Type = 'Totes'
+					End
+
+			-- Bounce the results against the Key to be sure we not only have values, but they are valid
+				If @intMatNrCheck<>@ItemMasterID
+					Begin
+						Set @strTemp='Item number= '+LTRIM(str(@ItemMasterID))
+						RAISERROR(51002,16,1,@strTemp)									-- Parameter %s is invalid.
+					End
+				If @intDeptIDCheck<>@intDept
+					Begin
+						Set @strTemp='Department ID= '+LTRIM(str(@intDept))
+						RAISERROR(51002,16,1,@strTemp)									-- Parameter %s is invalid.
+					End
+				If @intQCAttribCheck<>@intQcAttrib
+					Begin
+						Set @strTemp='QC Attribute= '+LTRIM(str(@intQcAttrib))
+						RAISERROR(51002,16,1,@strTemp)									-- Parameter %s is invalid.
+					End
+			End
+
+		-- If the Request is Update
+		IF @intprocessType=@intStatus_Update
+			Begin
+				if isnull(@intIdarRecord,0)=0 raiserror(51001,16,1,'Record ID')			-- "Parameter %s not supplied."
+				if isnull(@intUserID,0)=0 raiserror(51001,16,1,'User ID')				-- "Parameter %s not supplied."
+				--if isnull(@intreInvenQty,'')='' raiserror(51001,16,1,'Re-Inventory ')	-- "Parameter %s not supplied."
+				--if isnull(@intScrapQty,'')='' raiserror(51001,16,1,'Scrap Qty')			-- "Parameter %s not supplied."
+				--if isnull(@intRegrindQty,'')='' raiserror(51001,16,1,'Regrind QTY')		-- "Parameter %s not supplied."
+
+			-- Check the Entries if their valid values. Could be Issues with the values posting from source
+				Set @intIdarRecordCheck =(Select [UID] from tblQC_Idars Where [UID] = @intIdarRecord)
+				Set @intUserIdCheck = (Select [UID] from tblUsers Where [UID] = @intUserID)
+				Set @intrecordQty = (Select [HoldQty] from tblQC_Idars Where [Uid] = @intIdarRecord)
+				Set @intQtyType = (Select [HoldQty_Type]from tblQC_Idars Where [UID] = @intIdarRecord)
+				Set @intQcAttrib = (Select [QCAttrib] from tblQC_Idars Where [UID] = @intIdarRecord)
+				Set @ItemMasterID = (Select [Matnr] from tblQC_Idars  Where [UID] = @intIdarRecord)
+				Set @vStrItemMaster_Desc = (Select Matnr From tblMaterialMaster Where [UID] = @ItemMasterID)
+				Set @vStrQcAttrib_Desc = (Select QA_Attrib from [tblQCAttributes] Where [UID] = @intQcAttrib)
+				-- Set the QTY Type from the Input
+				If @intQtyType=1
+					Begin
+						Set @vStrQty_Type = 'Cases'
+					End
+				if @intQtyType =2
+					Begin
+						Set @vStrQty_Type = 'Totes'
+					End
+
+			-- Bounce the results against the Key to be sure we not only have values, but they are valid
+				If @intIdarRecordCheck<>@intIdarRecord
+					Begin
+						Set @strTemp='Record = '+LTRIM(str(@intIdarRecord))
+						RAISERROR(51003,16,1,@strTemp)										-- Record not found for %s.
+					End
+				If @intUserIdCheck<>@intUserID
+					Begin
+						Set @strTemp='User ID= '+LTRIM(str(@intUserID))
+						RAISERROR(51003,16,1,@strTemp)										-- Record not found for %s.
+					End
+				IF (@intreInvenQty+@intScrapQty+@intRegrindQty <>@intrecordQty)
+					Begin
+						Set @strTemp='Disposition QTY Requested ['+LTRIM(str(@intreInvenQty+@intScrapQty+@intRegrindQty))+'] Is Not = to Record QTY of ['+LTRIM(str(@intrecordQty))+']'
+						RAISERROR(51004,16,1,@strTemp)										-- %s.
+					End
+			-- When the Idar Record has been provided lets get the Status of the Record for Further Data Processing
+				IF (@intIdarRecordCheck=@intIdarRecord) and (@intIdarRecord <> 0) and (@intIdarRecord is not null)
+					Begin
+						Set @intIdarRecordStatus = (Select [Status] from tblQC_Idars Where [UID] = @intIdarRecord)
+					End
+			End	
+		-- If the Request is other!
+		IF (@intprocessType=@intStatus_Verified) or(@intprocessType=@intStatus_Validate) or (@intprocessType=@intStatus_Close)
+			Begin
+				if isnull(@intIdarRecord,0)=0 raiserror(51001,16,1,'Record ID')			-- "Parameter %s not supplied."
+				if isnull(@intUserID,0)=0 raiserror(51001,16,1,'User ID')				-- "Parameter %s not supplied."
+
+			-- Check the Entries if their valid values. Could be Issues with the values posting from source
+				Set @intIdarRecordCheck =(Select [UID] from tblQC_Idars Where [UID] = @intIdarRecord)
+				Set @intUserIdCheck = (Select [UID] from tblUsers Where [UID] = @intUserID)
+				Set @intrecordQty = (Select [HoldQty] from tblQC_Idars Where [Uid] = @intIdarRecord)
+				Set @intQtyType = (Select [HoldQty_Type]from tblQC_Idars Where [UID] = @intIdarRecord)
+				Set @intQcAttrib = (Select [QCAttrib] from tblQC_Idars Where [UID] = @intIdarRecord)
+				Set @ItemMasterID = (Select [Matnr] from tblQC_Idars  Where [UID] = @intIdarRecord)
+				Set @vStrItemMaster_Desc = (Select Matnr From tblMaterialMaster Where [UID] = @ItemMasterID)
+				Set @vStrQcAttrib_Desc = (Select QA_Attrib from [tblQCAttributes] Where [UID] = @intQcAttrib)
+				-- Set the QTY Type from the Input
+				If @intQtyType=1
+					Begin
+						Set @vStrQty_Type = 'Cases'
+					End
+				if @intQtyType =2
+					Begin
+						Set @vStrQty_Type = 'Totes'
+					End
+
+			-- Bounce the results against the Key to be sure we not only have values, but they are valid
+				If @intIdarRecordCheck<>@intIdarRecord
+					Begin
+						Set @strTemp='Record = '+LTRIM(str(@intIdarRecord))
+						RAISERROR(51003,16,1,@strTemp)										-- Record not found for %s.
+					End
+				If @intUserIdCheck<>@intUserID
+					Begin
+						Set @strTemp='User ID= '+LTRIM(str(@intUserID))
+						RAISERROR(51003,16,1,@strTemp)										-- Record not found for %s.
+					End
+			-- When the Idar Record has been provided lets get the Status of the Record for Further Data Processing
+				IF (@intIdarRecordCheck=@intIdarRecord) and (@intIdarRecord <> 0) and (@intIdarRecord is not null)
+					Begin
+						Set @intIdarRecordStatus = (Select [Status] from tblQC_Idars Where [UID] = @intIdarRecord)
+					End
+			End
+			
+
+		-- Hack alert Setting Fixed for testing. Current methos of determining Shifts Unknown (AB,CD have the same values)
+			Set @intShiftID = 1--(Select [UID] from tblShifts Where getdate() between [Start] and [End])
+		-- Hack Alert
+			Set @vStrShift = Convert(varchar(2),@intShiftID)
+			Set @UserName = (Select FirstName+'-'+LastName from tblUsers Where [UID] = @intUserID)
+			Set @CreateYear = LTRIM(str(DatePart(year,Getdate())))
+			Set @CreateDay = LTRIM(str(DatePart(Day,Getdate())))
+			Set @CreateMonth = LTRIM(str(datePart(Month,getdate())))
+			Set @CreateHour  = LTRIM(str(Datepart(Hour,GetDate())))
+			Set @CreateMiniute = LTRIM(str(DatePart(Minute,Getdate())))
+			Set @CreateDate = LTRIM(str(@CreateYear))+LTRIM(str(@CreateMonth))+LTRIM(str(@CreateDay))+LTRIM(str(@CreateHour))+LTRIM(str(@CreateMiniute))
+			Set @Email_FIleName = 'IDAR_Record_'+@CreateDate+'_'
+
+
+		-- Check if the Caller is Asking for Create new 
+		IF @intprocessType = @intStatus_New 
+				Begin
+					Insert into tblQC_Idars (Matnr,QCAttrib,HoldQty,[Shift],Dept,Machine,Created,CreatedBY,[Status],[HoldQty_Type]) Values(@ItemMasterID,@intQcAttrib,@intQTY,@intShiftID,@intDept,@intMachine,getdate(),@intUserID,@intStatus_New,@intQtyType)
+					Set @intResultCode = 1
+					Set @strResultText = 'Process Request Create Found..'
+					Set @intIdarID = Convert(int,SCOPE_IDENTITY())
+					Set @EmailQuery_Results = 'SELECT [UID],[Created],[RecordID],[Item Master],[QA_Attrib],[Shift],[HoldQty],[IDAR Status] FROM [ProdTracking_Dev].[dbo].[vQCIdarReport] Where [UID] = '+Str(@intIdarID)+''
+					Set @Email_Subject = 'A New IDAR Record ['+LTRIM(str(@intIdarID))+'] Was Created on  ['+Convert(nvarchar(35),Getdate())+'] By     '+@UserName
+					Set @Email_Body = 'The Fountain Inn Quality System has Logged a New Non-Conforming Product Record   '
+					Set @Email_Body = @Email_Body +'ItemMaster ['+@vStrItemMaster_Desc+'] Has ['+Convert(varchar(4),@intQTY)+'] '+Convert(varchar(6),@vStrQty_Type)+' Held for Reason['+Convert(Varchar(100),@vStrQcAttrib_Desc)+']'
+					Set @Email_FileName =@Email_FIleName +LTRIM(str(@intIdarID))+'.txt'
+					Set @Email_FileName = Replace(@Email_FileName,' ','-')
+					Set @Email_FileName = Replace(@Email_FileName,':','-')
+					Set @Email_FileName = Replace(@Email_FileName,'==','-')
+
+				End
+		-- Check if the Caller is Asking for an Update 
+		ELSE IF @intprocessType = @intStatus_Update
+				Begin
+					IF (@intIdarRecordCheck=@intIdarRecord) and (@intIdarRecordStatus = @intStatus_New)
+						Begin
+							Update tblQC_Idars Set [ReInventoryQty] = @intreInvenQty,ScrapQty = @intScrapQty,RegrindQty = @intRegrindQty, Updated = Getdate(), UpdatedBy = @intUserID, [Status]=@intStatus_Update Where [UID] = @intIdarRecord
+							Set @intResultCode = 1
+							Set @strResultText = 'Process Request Update Found..'
+							Set @EmailQuery_Results = 'SELECT [UID],[Created],[RecordID],[Item Master],[QA_Attrib],[Shift],[HoldQty],[IDAR Status] FROM [ProdTracking_Dev].[dbo].[vQCIdarReport] Where [UID] = '+Str(@intIdarRecord)+''
+							Set @Email_Subject = 'IDAR Record ['+LTRIM(str(@intIdarRecord))+'] Was Updated on  ['+Convert(nvarchar(35),Getdate())+'] By     '+@UserName
+							Set @Email_Body = ' The Fountain Inn Quality System has Updated a Non-Conforming Product Record ['+LTRIM(str(@intIdarRecord))+']'+CHAR(13)+CHAR(10)+' '
+							Set @Email_Body = @Email_Body + ' ItemMaster ['+@vStrItemMaster_Desc+'] Has ['+Convert(varchar(4),@intrecordQty)+'] '+Convert(varchar(6),@vStrQty_Type)+' Held for Reason['+Convert(Varchar(100),@vStrQcAttrib_Desc)+']'+CHAR(13)+CHAR(10)+' '
+							Set @Email_Body = @Email_Body + ' The New Disposition Is as Follows:'+CHAR(13)+CHAR(10)+' '
+							Set @Email_Body = @Email_Body + ' [ReInventoryQty] = ['+Convert(varchar(4),@intreInvenQty)+']'+CHAR(13)+CHAR(10)+' '
+							Set @Email_Body = @Email_Body + ' ScrapQty = ['+Convert(varchar(4),@intScrapQty)+']'+CHAR(13)+CHAR(10) +' '
+							Set @Email_Body = @Email_Body + ' RegrindQty = ['+Convert(varchar(4),@intRegrindQty)+']'+CHAR(13)+CHAR(10)+' '
+							Set @Email_Body = @Email_Body + ' Record was Updated on ['+Convert(nvarchar(35),Getdate())+']'+CHAR(13)+CHAR(10)+' '
+							Set @Email_FileName =@Email_FIleName +LTRIM(str(@intIdarRecord))+'.txt'
+							Set @Email_FileName = Replace(@Email_FileName,' ','-')
+							Set @Email_FileName = Replace(@Email_FileName,':','-')
+							Set @Email_FileName = Replace(@Email_FileName,'==','-')
+							Set @intIdarID =@intIdarRecord
+						End
+					IF @intIdarRecordCheck<>@intIdarRecord
+						Begin
+							Set @strTemp='IDAR Record= '+LTRIM(str(@intIdarRecord))
+							RAISERROR(51003,16,1,@strTemp)									-- Record not found for %s.
+						End
+					IF (@intIdarRecordStatus <> @intStatus_New)
+						Begin
+							Set @strTemp='IDAR Record ['+LTRIM(str(@intIdarRecord))+'] Status= ['+LTRIM(str(@intIdarRecordStatus)) + '] Not Valid for Updating'
+							RAISERROR(51004,16,1,@strTemp)									-- %s.
+						End
+				End
+		-- Check if the Caller is Asking for Verification
+		ELSE IF @intprocessType = @intStatus_Verified 
+				Begin
+					IF (@intIdarRecordCheck=@intIdarRecord) and (@intIdarRecordStatus = @intStatus_Update)
+						Begin
+							Update tblQC_Idars Set Verified = Getdate(), VerifiedBy = @intUserID, [Status]= @intStatus_Verified Where [UID] = @intIdarRecord 
+							Set @intResultCode = 1
+							Set @strResultText = 'Process Request Verify Found..'
+							Set @EmailQuery_Results = 'SELECT [UID],[Created],[RecordID],[Item Master],[QA_Attrib],[Shift],[HoldQty],[IDAR Status] FROM [ProdTracking_Dev].[dbo].[vQCIdarReport] Where [UID] = '+Str(@intIdarRecord)+''
+							Set @Email_Subject = 'IDAR Record ['+LTRIM(str(@intIdarRecord))+'] Was Verified on  ['+Convert(nvarchar(35),Getdate())+'] By     '+@UserName
+							Set @Email_Body = ' The Fountain Inn Quality System has Updated a Non-Conforming Product Record ['+LTRIM(str(@intIdarRecord))+']'+CHAR(13)+CHAR(10)+' '
+							Set @Email_Body = @Email_Body + ' ItemMaster ['+@vStrItemMaster_Desc+'] Had ['+Convert(varchar(4),@intrecordQty)+'] '+Convert(varchar(6),@vStrQty_Type)+' Held for Reason['+Convert(Varchar(100),@vStrQcAttrib_Desc)+']'+CHAR(13)+CHAR(10)+' '
+							Set @Email_Body = @Email_Body + ' This record has Been Verified By:'+CHAR(13)+CHAR(10)+' '
+							Set @Email_Body = @Email_Body + ' User: '+@UserName+CHAR(13)+CHAR(10)+' '
+							Set @Email_Body = @Email_Body + ' Record was Verified on ['+Convert(nvarchar(35),Getdate())+']'+CHAR(13)+CHAR(10)+' '
+							Set @Email_FileName =@Email_FIleName +LTRIM(str(@intIdarRecord))+'.txt'
+							Set @Email_FileName = Replace(@Email_FileName,' ','-')
+							Set @Email_FileName = Replace(@Email_FileName,':','-')
+							Set @Email_FileName = Replace(@Email_FileName,'==','-')
+							Set @intIdarID =@intIdarRecord
+						End
+					IF @intIdarRecordCheck<>@intIdarRecord
+						Begin
+							Set @strTemp='ID= '+LTRIM(str(@intIdarRecord))
+							RAISERROR(51003,16,1,@strTemp)									-- Record not found for %s.
+						End
+					IF (@intIdarRecordStatus <> @intStatus_Update)
+						Begin
+							Set @strTemp='IDAR Record ['+LTRIM(str(@intIdarRecord))+'] Status= ['+LTRIM(str(@intIdarRecordStatus)) + '] Not Valid for Updating'
+							RAISERROR(51004,16,1,@strTemp)									-- %s.
+						End
+				End
+		-- Check if the Caller is Asking for Validation
+		ELSE IF @intprocessType = @intStatus_Validate
+				Begin
+					IF (@intIdarRecordCheck=@intIdarRecord) and (@intIdarRecordStatus = @intStatus_Verified)
+						Begin
+							Update tblQC_Idars Set Validated = Getdate(),ValidatedBy = @intUserID, [Status]=@intStatus_Validate Where [UID] = @intIdarRecord 
+							Set @intResultCode = 1
+							Set @strResultText = 'Process Request Validate Found..'
+							Set @EmailQuery_Results = 'SELECT [UID],[Created],[RecordID],[Item Master],[QA_Attrib],[Shift],[HoldQty],[IDAR Status] FROM [ProdTracking_Dev].[dbo].[vQCIdarReport] Where [UID] = '+Str(@intIdarRecord)+''
+							Set @Email_Subject = 'IDAR Record ['+LTRIM(str(@intIdarRecord))+'] Was Validated on  ['+Convert(nvarchar(35),Getdate())+'] By     '+@UserName
+							Set @Email_Body = ' The Fountain Inn Quality System has Updated a Non-Conforming Product Record ['+LTRIM(str(@intIdarRecord))+']'+CHAR(13)+CHAR(10)+' '
+							Set @Email_Body = @Email_Body + ' ItemMaster ['+@vStrItemMaster_Desc+'] Had ['+Convert(varchar(4),@intrecordQty)+'] '+Convert(varchar(6),@vStrQty_Type)+' Held for Reason['+Convert(Varchar(100),@vStrQcAttrib_Desc)+']'+CHAR(13)+CHAR(10)+' '
+							Set @Email_Body = @Email_Body + ' This record has Been Validated By:'+CHAR(13)+CHAR(10)+' '
+							Set @Email_Body = @Email_Body + ' User:'+@UserName+CHAR(13)+CHAR(10)+' '
+							Set @Email_Body = @Email_Body + ' Record was Validated on ['+Convert(nvarchar(35),Getdate())+']'+CHAR(13)+CHAR(10)+' '
+							Set @Email_FileName =@Email_FIleName +LTRIM(str(@intIdarRecord))+'.txt'
+							Set @Email_FileName = Replace(@Email_FileName,' ','-')
+							Set @Email_FileName = Replace(@Email_FileName,':','-')
+							Set @Email_FileName = Replace(@Email_FileName,'==','-')
+							Set @intIdarID =@intIdarRecord
+						End
+					IF @intIdarRecordCheck<>@intIdarRecord
+						Begin
+							Set @strTemp='IDAR Record= '+LTRIM(str(@intIdarRecord))
+							RAISERROR(51002,16,1,@strTemp)									-- Parameter %s is invalid.
+						End
+					IF (@intIdarRecordStatus <> @intStatus_Verified)
+						Begin
+							Set @strTemp='IDAR Record ['+LTRIM(str(@intIdarRecord))+'] Status= ['+LTRIM(str(@intIdarRecordStatus)) + '] Not Valid for Updating'
+							RAISERROR(51004,16,1,@strTemp)									-- %s.
+						End
+				End
+		-- Check if the Caller is Asking for Close record
+		ELSE IF (@intprocessType = @intStatus_Close)
+				Begin
+					IF (@intIdarRecordCheck=@intIdarRecord) and (@intIdarRecordStatus = @intStatus_Validate)
+						Begin
+							Update tblQC_Idars Set Closed = Getdate(),ClosedBy = @intUserID, [Status]=@intStatus_Close Where [UID] = @intIdarRecord 
+							Set @intResultCode = 1
+							Set @strResultText = 'Process Request Close Found..'
+							Set @EmailQuery_Results = 'SELECT [UID],[Created],[RecordID],[Item Master],[QA_Attrib],[Shift],[HoldQty],[IDAR Status] FROM [ProdTracking_Dev].[dbo].[vQCIdarReport] Where [UID] = '+Str(@intIdarRecord)+''
+							Set @Email_Subject = 'IDAR Record ['+LTRIM(str(@intIdarRecord))+'] Was Closed on  ['+Convert(nvarchar(35),Getdate())+'] By     '+@UserName
+							Set @Email_Body = ' The Fountain Inn Quality System has Updated a Non-Conforming Product Record ['+LTRIM(str(@intIdarRecord))+']'+CHAR(13)+CHAR(10)+' '
+							Set @Email_Body = @Email_Body + ' ItemMaster ['+@vStrItemMaster_Desc+'] Had ['+Convert(varchar(4),@intrecordQty)+'] '+Convert(varchar(6),@vStrQty_Type)+' Held for Reason['+Convert(Varchar(100),@vStrQcAttrib_Desc)+']'+CHAR(13)+CHAR(10)+' '
+							Set @Email_Body = @Email_Body + ' This record has Been Closed By:'+CHAR(13)+CHAR(10)+' '
+							Set @Email_Body = @Email_Body + ' User:'+@UserName+CHAR(13)+CHAR(10)+' '
+							Set @Email_Body = @Email_Body + ' Record was Closed on ['+Convert(nvarchar(35),Getdate())+']'+CHAR(13)+CHAR(10)+' '
+							Set @Email_FileName =@Email_FIleName +LTRIM(str(@intIdarRecord))+'.txt'
+							Set @Email_FileName = Replace(@Email_FileName,' ','-')
+							Set @Email_FileName = Replace(@Email_FileName,':','-')
+							Set @Email_FileName = Replace(@Email_FileName,'==','-')
+							Set @intIdarID =@intIdarRecord
+						End
+					IF @intIdarRecordCheck<>@intIdarRecord
+						Begin
+							Set @strTemp='IDAR Record= '+LTRIM(str(@intIdarRecord))
+							RAISERROR(51002,16,1,@strTemp)									-- Parameter %s is invalid.
+						End
+					IF (@intIdarRecordStatus <> @intStatus_Validate)
+						Begin
+							Set @strTemp='IDAR Record Status= '+LTRIM(str(@intIdarRecordStatus)) + 'Not Valid for Closing'
+							RAISERROR(51004,16,1,@strTemp)									-- %s.
+						End
+				End
+		ELSE
+		-- Let the Caller know we did not find a Place holder for the requested value
+			Begin
+				Set @intResultCode = 99
+				Set @strResultText = 'Process Request Not Found for ['+Cast(@intprocessType as varchar(10))+']'
+			END
+
+		-- All Has Passed Lets Inform Quality that an IDAR Record Has been Worked on
+			Exec as Caller
+			exec  msdb.dbo.sp_send_dbmail
+			   @profile_name ='FI_DBMail' ,    
+			   @recipients ='acannon@dwfp.com;LBenitez@dwfp.com',
+			   @subject=@Email_Subject,
+			   @body=@Email_Body,
+			   @query = @EmailQuery_Results,
+			   @query_attachment_filename=@Email_FileName,
+			   @attach_query_result_as_file = 1,
+			   @Query_Result_width = 1000
+		   
+
+	End try
+
+	begin catch
+		-- Set return values
+		select @intResultCode=error_number(), @strResultText=error_message()
+
+		-- Prior to logging message we need to roll back any started 
+		-- transactions
+		if (xact_state()) <> 0
+			rollback transaction
+
+		-- Insert message into the error log
+	    insert into tblErrorLog
+			(MsgDate, 
+			 MsgNumber, 
+			 MsgText, 
+			 MsgSeverity, 
+			 MsgProcedure)
+			values
+			(getdate(),
+			 error_number(),
+			 error_message(),
+			 error_severity(),
+			 error_procedure())
+	end catch
+
+
+END
+
